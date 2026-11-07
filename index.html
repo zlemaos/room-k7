@@ -1,30 +1,55 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow,noarchive"><title>Access</title>
 <style>body{margin:0;background:#080808;color:#fff;font:18px/1.5 sans-serif}main{max-width:440px;margin:10vh auto;padding:24px}input,button{font:inherit;min-height:48px;padding:8px;box-sizing:border-box;width:100%;margin:12px 0;background:#171717;color:#fff;border:1px solid #999}iframe{position:fixed;inset:0;width:100%;height:100%;border:0;background:#080808}p{overflow-wrap:anywhere}</style></head>
-<body><main><h1>Access</h1><form><label for="p">Password</label><input id="p" type="password" autocomplete="current-password" required><button>Open</button></form><p id="status" role="status"></p></main><script src="1905bf0795b3ff70b0eb790385d53b62484a140bbe7ab8011931e998e88ad97e.js"></script><script>
+<body><main><h1>Access</h1><form><label for="p">Password</label><input id="p" type="password" autocomplete="current-password" required><button>Open</button></form><p id="status" role="status"></p></main><script src="57a9356b5037c46f838519840784e4d0bb67571e7de38d3d43183eabf8a1db89.js"></script><script>
 'use strict';
-const unhex=s=>Uint8Array.from(s.match(/../g),x=>parseInt(x,16));
+// Format (see tools/build_publish.cjs): every file is base64(iv ‖ AES-256-GCM ciphertext ‖ tag) with its label as
+// additional data; the plaintext is u32le headerLen ‖ header JSON ‖ bytes. The key is derived once and kept here;
+// per-section media chunks are loaded and decrypted only when the app asks for them, then cached as blob: URLs.
 const bytes=s=>Uint8Array.from(atob(s),x=>x.charCodeAt(0));
+const typeOf=n=>n.endsWith('.mp3')?'audio/mpeg':n.endsWith('.woff2')?'font/woff2':n.endsWith('.js')?'text/javascript':n.endsWith('.json')?'application/json':n.endsWith('.css')?'text/css':'text/plain';
+let key=null,chunks={};const audioCache={};
+async function unseal(k,label,data){
+ const plain=new Uint8Array(await crypto.subtle.decrypt({name:'AES-GCM',iv:data.slice(0,12),additionalData:new TextEncoder().encode(label)},k,data.slice(12)));
+ const len=new DataView(plain.buffer).getUint32(0,true),header=JSON.parse(new TextDecoder().decode(plain.subarray(4,4+len))),base=4+len,files={};
+ for(const f of header.files)files[f.n]=plain.subarray(base+f.o,base+f.o+f.l);
+ return {header,files};
+}
+function loadChunk(name){
+ return new Promise((resolve,reject)=>{
+  const s=document.createElement('script');s.src=name;
+  s.onload=()=>{s.remove();const d=(globalThis.FLY_CHUNKS||{})[name];if(d)delete globalThis.FLY_CHUNKS[name];d?resolve(d):reject(Error('chunk missing'));};
+  s.onerror=()=>{s.remove();reject(Error('chunk missing'));};
+  document.head.append(s);
+ });
+}
+globalThis.FLY_AUDIO=id=>{
+ if(!audioCache[id])audioCache[id]=(async()=>{
+  if(!key||!chunks[id])throw Error('locked');
+  const {files}=await unseal(key,id,bytes(await loadChunk(chunks[id]))),urls={};
+  for(const [n,data] of Object.entries(files))urls[n]=URL.createObjectURL(new Blob([data],{type:typeOf(n)}));
+  return urls;
+ })().catch(err=>{delete audioCache[id];throw err;});
+ return audioCache[id];
+};
 document.querySelector('form').addEventListener('submit',async e=>{
  e.preventDefault();const button=document.querySelector('button'),status=document.getElementById('status');button.disabled=true;status.textContent='Opening…';
  try{
   const material=await crypto.subtle.importKey('raw',new TextEncoder().encode(document.getElementById('p').value),'PBKDF2',false,['deriveKey']);
-  const key=await crypto.subtle.deriveKey({name:'PBKDF2',salt:unhex(PACKET.s),iterations:PACKET.n,hash:'SHA-256'},material,{name:'AES-GCM',length:256},false,['decrypt']);
-  const raw=await crypto.subtle.decrypt({name:'AES-GCM',iv:unhex(PACKET.v)},key,unhex(PACKET.d));
-  const files=JSON.parse(new TextDecoder().decode(raw)),urls={};
-  for(const [name,data] of Object.entries(files)){
-   const type=name.endsWith('.mp3')?'audio/mpeg':name.endsWith('.woff2')?'font/woff2':name.endsWith('.js')?'text/javascript':name.endsWith('.css')?'text/css':'text/plain';
-   if(!name.endsWith('.html')&&!name.endsWith('.css'))urls[name]=URL.createObjectURL(new Blob([bytes(data)],{type}));
-  }
-  const text=n=>new TextDecoder().decode(bytes(files[n]));
+  const k=await crypto.subtle.deriveKey({name:'PBKDF2',salt:bytes(PACKET.s),iterations:PACKET.n,hash:'SHA-256'},material,{name:'AES-GCM',length:256},false,['decrypt']);
+  const {header,files}=await unseal(k,'packet',bytes(PACKET.d));
+  key=k;chunks=header.chunks||{};
+  const urls={};
+  for(const [name,data] of Object.entries(files))if(!name.endsWith('.html')&&!name.endsWith('.css'))urls[name]=URL.createObjectURL(new Blob([data],{type:typeOf(name)}));
+  const text=n=>new TextDecoder().decode(files[n]);
   let css=text('app.css');for(const [n,url] of Object.entries(urls))css=css.split(n).join(url);
   urls['app.css']=URL.createObjectURL(new Blob([css],{type:'text/css'}));
   let html=text('index.html');
-  html=html.replace('<head>','<head><script>window.ASSETS='+JSON.stringify(urls)+';<\/script>');
+  html=html.replace('<head>','<head><script>window.ASSETS='+JSON.stringify(urls)+';window.LESSON_AUDIO=id=>parent.FLY_AUDIO(id);<\/script>');
   html=html.replace(/(src|href)="([^"]+)"/g,(all,attr,n)=>urls[n]?attr+'="'+urls[n]+'"':all);
   const frame=document.createElement('iframe');frame.title='Workspace';frame.srcdoc=html;document.body.append(frame);
   document.getElementById('p').value='';delete globalThis.PACKET;status.textContent='';
- }catch(err){status.textContent='Could not open. Check the password and try again.';}
+ }catch(err){key=null;status.textContent='Could not open. Check the password and try again.';}
  finally{button.disabled=false;}
 });
 </script></body></html>
